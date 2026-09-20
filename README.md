@@ -113,11 +113,13 @@ chat_record = Chat.create!(model: "gpt-4o-mini")
 chat_record.ask("Hi")
 ```
 
-This applies to the modern `acts_as` API (`config.use_new_acts_as = true`). Everywhere
-else — plain `RubyLLM.chat`, the legacy `acts_as` API, or a conversation store outside
-ActiveRecord — set `gen_ai.conversation.id` via `with_otel_attributes` using a real
-conversation/session identifier from your application. An id you set this way always
-wins over the automatic one:
+On `ruby_llm` 2.x this is the only `acts_as` API there is. On 1.x it applies to the
+modern `acts_as` API (`config.use_new_acts_as = true`); 2.0 ignores that setting and
+tells you so — `config.use_new_acts_as is ignored in RubyLLM 2.0; remove it from your
+initializer`. Everywhere else — plain `RubyLLM.chat`, 1.x's legacy `acts_as` API, or a
+conversation store outside ActiveRecord — set `gen_ai.conversation.id` via
+`with_otel_attributes` using a real conversation/session identifier from your
+application. An id you set this way always wins over the automatic one:
 
 ```ruby
 chat.with_otel_attributes("gen_ai.conversation.id" => session.id)
@@ -157,10 +159,10 @@ This produces one trace rooted at `invoke_agent ResearchAgent`
 (`gen_ai.operation.name` = `invoke_agent`, `gen_ai.agent.name` = `ResearchAgent`), with
 the chat and tool spans nested beneath it.
 
-When the agent's chat is a persisted `acts_as_chat` record on the modern `acts_as` API,
-the `invoke_agent` span and the chat spans nested beneath it all carry
-`gen_ai.conversation.id` set to the record's id, so multi-turn conversations correlate
-across jobs and requests without any extra code.
+When the agent's chat is a persisted `acts_as_chat` record, the `invoke_agent` span and
+the chat spans nested beneath it all carry `gen_ai.conversation.id` set to the record's
+id, so multi-turn conversations correlate across jobs and requests without any extra
+code.
 
 With `capture_content` enabled, the `invoke_agent` span also records
 `gen_ai.input.messages` (the conversation history going in) and
@@ -199,13 +201,42 @@ This gem follows the [OpenTelemetry GenAI Semantic Conventions](https://opentele
 
 ## Compatibility
 
-This gem is tested against the following `ruby_llm` versions:
+Both `ruby_llm` majors are supported and produce equivalent traces — the same span
+names, span kinds and attributes — whether OpenAI is reached through the Chat Completions
+API (1.x) or the Responses API (2.0's default).
+
+A turn that calls tools is one trace on both majors, but it is held together
+differently. On 1.x `Chat#complete` recurses, so each round nests inside the previous
+one. On 2.0 that loop became iterative and tools run between requests, so the turn is
+wrapped in an extra `chat_turn <model>` span (`INTERNAL`, `gen_ai.operation.name` =
+`chat_turn`) that the `chat` and `execute_tool` spans hang from. It carries no usage
+attributes, and it is named apart from `chat` because a `chat` span means exactly one
+provider request on every version. Under an agent it nests inside `invoke_agent`, so an
+agent that takes several turns gets one `chat_turn` span per turn.
+
+This gem is tested against:
 
 - `1.8.0` (minimum supported)
 - `1.12.1` (agent tracing floor — `RubyLLM::Agent` shipped in 1.12.0, but only loads outside Rails from 1.12.1)
 - `~> 1.8` (latest 1.x release)
+- `2.0.0` (minimum supported 2.x)
+- `~> 2.0` (latest 2.x release)
+
+Each major has moved the APIs this gem reads, so a `ruby_llm` major it does not know is
+refused at install time — with a log line saying so — rather than installed and left to
+fail on the first chat.
 
 The Ruby matrix covers Ruby 3.1, 3.2, 3.3, and 3.4.
+
+### Working on the version matrix
+
+`gemfiles/` is generated from `Appraisals`. After changing either, regenerate the
+gemfiles and commit them — the `.gemfile`s are tracked, the `.lock`s are gitignored:
+
+```sh
+bundle exec appraisal install
+BUNDLE_GEMFILE=gemfiles/ruby_llm_2.0.0.gemfile bundle exec rake
+```
 
 ## License
 

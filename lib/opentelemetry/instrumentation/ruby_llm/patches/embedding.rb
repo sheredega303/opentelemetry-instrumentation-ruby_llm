@@ -5,14 +5,17 @@ module OpenTelemetry
     module RubyLLM
       module Patches
         module Embedding
-          def embed(text, model: nil, provider: nil, assume_model_exists: false, context: nil, dimensions: nil)
+          # Naming the keywords exhaustively would reject every caller using
+          # one a later ruby_llm adds, as 2.0 did with five.
+          def embed(text, model: nil, provider: nil, assume_model_exists: false, context: nil, **options)
             config = context&.config || ::RubyLLM.config
             resolved_model = model || config.default_embedding_model
-            model_obj, _provider_instance = ::RubyLLM::Models.resolve(
-              resolved_model, provider: provider, assume_exists: assume_model_exists, config: config
+            model_obj = Adapters.current.resolve_model(
+              resolved_model, provider: provider, assume_model_exists: assume_model_exists, config: config
             )
-            model_id = model_obj.id
-            provider_name = model_obj.provider || "unknown"
+            # 2.0 resolves to a nil model for operations that take none.
+            model_id = model_obj&.id || "unknown"
+            provider_name = model_obj&.provider || "unknown"
 
             attributes = {
               "gen_ai.operation.name" => "embeddings",
@@ -31,7 +34,9 @@ module OpenTelemetry
               end
 
               span.set_attribute("gen_ai.response.model", result.model) if result.model
-              span.set_attribute("gen_ai.usage.input_tokens", result.input_tokens) if result.input_tokens&.positive?
+
+              input_tokens = Adapters.current.embedding_input_tokens(result)
+              span.set_attribute("gen_ai.usage.input_tokens", input_tokens) if input_tokens&.positive?
 
               if result.vectors.is_a?(Array)
                 first = result.vectors.first

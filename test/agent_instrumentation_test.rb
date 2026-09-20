@@ -87,8 +87,7 @@ if defined?(RubyLLM::Agent)
     end
 
     def test_records_error_on_agent_span_when_ask_fails
-      stub_request(:post, "https://api.openai.com/v1/chat/completions")
-        .to_return(status: 500, body: "Internal Server Error")
+      stub_chat_completion_failure
 
       agent = ResearchAgent.new
 
@@ -105,8 +104,7 @@ if defined?(RubyLLM::Agent)
     end
 
     def test_sets_otel_attributes_on_agent_span_when_ask_fails
-      stub_request(:post, "https://api.openai.com/v1/chat/completions")
-        .to_return(status: 500, body: "Internal Server Error")
+      stub_chat_completion_failure
 
       agent = ResearchAgent.new
       agent.with_otel_attributes("langfuse.session.id" => "session-1")
@@ -171,7 +169,7 @@ if defined?(RubyLLM::Agent)
       calculator = Class.new(RubyLLM::Tool) do
         def self.name = "calculator"
         description "Performs math"
-        param :expression, type: "string", desc: "Math expression"
+        tool_parameter :expression, type: "string", description: "Math expression"
 
         def execute(expression:)
           eval(expression).to_s
@@ -181,20 +179,16 @@ if defined?(RubyLLM::Agent)
       stub_chat_completion(
         chat_completion_body(
           content: nil,
-          tool_calls: [{
-            id: "call_abc123",
-            type: "function",
-            function: { name: "calculator", arguments: '{"expression":"2+2"}' }
-          }]
+          tool_calls: [{ id: "call_abc123", name: "calculator", arguments: '{"expression":"2+2"}' }]
         ),
         chat_completion_body(
           content: "The answer is 4",
-          usage: { prompt_tokens: 20, completion_tokens: 5, total_tokens: 25 }
+          usage: { input_tokens: 20, output_tokens: 5 }
         )
       )
 
       agent = ResearchAgent.new
-      agent.with_tool(calculator)
+      with_tool(agent, calculator)
       agent.ask("What is 2+2?")
 
       spans = EXPORTER.finished_spans
