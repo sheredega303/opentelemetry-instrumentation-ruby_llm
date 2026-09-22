@@ -4,11 +4,23 @@ module OpenTelemetry
   module Instrumentation
     module RubyLLM
       module Patches
+        # Set while an `invoke_agent` span is open so the 2.0 chat patch can
+        # tell that the turn it is about to wrap already has one.
+        AGENT_SPAN_KEY = OpenTelemetry::Context.create_key("ruby_llm.agent_span")
+
         # Span plumbing shared by the chat, agent and embedding patches: the
         # tracer, the version adapter, the two capture settings, and the
         # writers for custom attributes and errors.
         module SpanHelpers
           private
+
+          def agent_span_open?
+            !OpenTelemetry::Context.current[AGENT_SPAN_KEY].nil?
+          end
+
+          def with_agent_span_marker(&)
+            OpenTelemetry::Context.with_value(AGENT_SPAN_KEY, true, &)
+          end
 
           def tracer
             RubyLLM::Instrumentation.instance.tracer

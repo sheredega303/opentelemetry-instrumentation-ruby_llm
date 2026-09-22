@@ -231,11 +231,14 @@ one structural way, described below.
 A turn that calls tools is one trace on both majors, but it is held together
 differently. On 1.x `Chat#complete` recurses, so each round nests inside the previous
 one. On 2.0 that loop became iterative and tools run between requests, so the turn is
-wrapped in an extra `chat_turn <model>` span (`INTERNAL`, `gen_ai.operation.name` =
-`chat_turn`) that the `chat` and `execute_tool` spans hang from. It carries no usage
-attributes, and it is named apart from `chat` because a `chat` span means one
-provider call on every version. Under an agent it nests inside `invoke_agent`, so an
-agent that takes several turns gets one `chat_turn` span per turn.
+wrapped in an extra `invoke_agent <model>` span (`INTERNAL`, `gen_ai.operation.name` =
+`invoke_agent`) that the `chat` and `execute_tool` spans hang from. The GenAI
+conventions define `invoke_agent` as agent invocation within the same process and
+prescribe that name when no agent name is available, which is what a local
+tool-calling loop is. It carries no usage attributes, and it is named apart from
+`chat` because a `chat` span means one provider call on every version. Under an
+agent the wrapper is skipped, because `Patches::Agent` has already opened an
+`invoke_agent` span for the turn.
 
 The wrapper means a 2.0 tool turn emits one more span than the same turn on 1.x,
 which is worth knowing if your backend prices per span.

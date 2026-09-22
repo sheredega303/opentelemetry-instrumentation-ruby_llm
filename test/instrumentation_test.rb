@@ -237,7 +237,7 @@ class InstrumentationTest < Minitest::Test
   end
 
   # A turn that calls a tool must stay one trace: 1.x nests it by recursing,
-  # 2.0 needs the `chat_turn` wrapper. Asserted as a shape, not by name,
+  # 2.0 needs the `invoke_agent` wrapper. Asserted as a shape, not by name,
   # so the test is honest on both majors.
   def test_tool_call_turn_is_a_single_trace
     calculator = Class.new(RubyLLM::Tool) do
@@ -270,10 +270,11 @@ class InstrumentationTest < Minitest::Test
 
     if RUBY_LLM_V2
       # The wrapper is INTERNAL and named apart from `chat` on purpose: a
-      # `chat` span means exactly one provider request on every version.
-      assert_equal "chat_turn gpt-4o-mini", roots.first.name
+      # `chat` span means exactly one provider request on every version, and
+      # the conventions prescribe `invoke_agent` for an in-process loop.
+      assert_equal "invoke_agent gpt-4o-mini", roots.first.name
       assert_equal OpenTelemetry::Trace::SpanKind::INTERNAL, roots.first.kind
-      assert_equal "chat_turn", roots.first.attributes["gen_ai.operation.name"]
+      assert_equal "invoke_agent", roots.first.attributes["gen_ai.operation.name"]
       refute roots.first.attributes.key?("gen_ai.usage.input_tokens"), "wrapper must not double-count usage"
     else
       assert_equal "chat gpt-4o-mini", roots.first.name
@@ -514,7 +515,7 @@ class InstrumentationTest < Minitest::Test
   end
 
   # Backends like Langfuse read trace-level attributes off the root span, so
-  # every root must carry them — including 2.0's `chat_turn` wrapper.
+  # every root must carry them — including 2.0's `invoke_agent` wrapper.
   def test_with_otel_attributes_reach_the_trace_root_of_a_tool_turn
     calculator = Class.new(RubyLLM::Tool) do
       def self.name = "calculator"

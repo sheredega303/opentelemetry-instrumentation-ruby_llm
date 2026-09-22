@@ -39,18 +39,22 @@ module OpenTelemetry
 
             span_name = agent_name ? "invoke_agent #{agent_name}" : "invoke_agent"
 
-            tracer.in_span(span_name,
-                           attributes: attributes,
-                           kind: OpenTelemetry::Trace::SpanKind::INTERNAL,
-                           record_exception: false) do |span|
-              result = yield
-              safely { capture_messages(span) }
-              result
-            rescue => e
-              record_error(span, e)
-              raise
-            ensure
-              set_custom_attributes(span)
+            # The marker keeps the 2.0 chat patch from opening a second
+            # `invoke_agent` span for each turn inside this one.
+            with_agent_span_marker do
+              tracer.in_span(span_name,
+                             attributes: attributes,
+                             kind: OpenTelemetry::Trace::SpanKind::INTERNAL,
+                             record_exception: false) do |span|
+                result = yield
+                safely { capture_messages(span) }
+                result
+              rescue => e
+                record_error(span, e)
+                raise
+              ensure
+                set_custom_attributes(span)
+              end
             end
           end
 

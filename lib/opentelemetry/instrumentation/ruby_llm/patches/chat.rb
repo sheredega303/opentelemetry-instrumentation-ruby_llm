@@ -143,24 +143,29 @@ module OpenTelemetry
           end
 
           # 2.0 runs tools between `generate` calls, so without this span a
-          # turn is three sibling roots, i.e. three unrelated traces. Not
-          # named `chat`: that means exactly one provider request on every
-          # version. Carries no usage, so nothing is counted twice, but it is
-          # the trace root, so it must carry the custom attributes that
-          # backends read at trace level.
+          # turn is three sibling roots, i.e. three unrelated traces. Named
+          # `invoke_agent` because the GenAI conventions define that as agent
+          # invocation within the same process and prescribe it when no agent
+          # name is available; `chat` stays reserved for exactly one provider
+          # request on every version. Carries no usage, so nothing is counted
+          # twice, but it is the trace root, so it must carry the custom
+          # attributes that backends read at trace level.
           def complete(&)
             return super unless otel_turn_loops?
+            # `Patches::Agent` already opened an `invoke_agent` span for this
+            # turn; a second one would nest identically-named spans.
+            return super if agent_span_open?
 
             model_id = @model&.id || "unknown"
             attributes = {
-              "gen_ai.operation.name" => "chat_turn",
+              "gen_ai.operation.name" => "invoke_agent",
               "gen_ai.provider.name" => @model&.provider || "unknown",
               "gen_ai.request.model" => model_id
             }
             conversation_id = otel_conversation_id
             attributes["gen_ai.conversation.id"] = conversation_id if conversation_id
 
-            tracer.in_span("chat_turn #{model_id}",
+            tracer.in_span("invoke_agent #{model_id}",
                            attributes: attributes,
                            kind: OpenTelemetry::Trace::SpanKind::INTERNAL,
                            record_exception: false) do |span|
