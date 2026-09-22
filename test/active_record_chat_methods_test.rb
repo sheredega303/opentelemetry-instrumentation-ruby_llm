@@ -32,7 +32,8 @@ if RUBY_LLM_V2
   # ruby_llm 2.0 owns the registry, tool-call, usage and batch tables itself
   # and auto-wires the stores from `ActsAs.included`; the application keeps
   # only `chats` and `messages`. Mirrors the install generator's migrations in
-  # `lib/generators/ruby_llm/install/templates/`.
+  # `lib/generators/ruby_llm/install/templates/` as of ruby_llm 2.0.0; the
+  # `~> 2.0` lane floats, so a column added in a later 2.x release fails here.
   ActiveRecord::Schema.define do
     create_table :ruby_llm_models do |t|
       t.string :model_id, null: false

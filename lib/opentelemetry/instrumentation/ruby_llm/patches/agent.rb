@@ -1,10 +1,15 @@
 # frozen_string_literal: true
 
+require_relative "span_helpers"
+require_relative "../message_formatter"
+
 module OpenTelemetry
   module Instrumentation
     module RubyLLM
       module Patches
         module Agent
+          include SpanHelpers
+
           def with_otel_attributes(attributes)
             @otel_attributes = attributes
             llm_chat.with_otel_attributes(attributes)
@@ -34,12 +39,15 @@ module OpenTelemetry
 
             span_name = agent_name ? "invoke_agent #{agent_name}" : "invoke_agent"
 
-            tracer.in_span(span_name, attributes: attributes, kind: OpenTelemetry::Trace::SpanKind::INTERNAL) do |span|
+            tracer.in_span(span_name,
+                           attributes: attributes,
+                           kind: OpenTelemetry::Trace::SpanKind::INTERNAL,
+                           record_exception: false) do |span|
               result = yield
-              capture_messages(span)
+              safely { capture_messages(span) }
               result
             rescue => e
-              span.set_attribute("error.type", e.class.name)
+              record_error(span, e)
               raise
             ensure
               set_custom_attributes(span)
@@ -59,23 +67,6 @@ module OpenTelemetry
 
           def llm_chat
             chat.respond_to?(:to_llm) ? chat.to_llm : chat
-          end
-
-          def capture_content?
-            env_value = ENV["OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"]
-            return env_value.to_s.strip.casecmp("true").zero? unless env_value.nil?
-
-            RubyLLM::Instrumentation.instance.config[:capture_content]
-          end
-
-          def set_custom_attributes(span)
-            @otel_attributes&.each { |key, value| span.set_attribute(key, value.respond_to?(:call) ? value.call : value) }
-          rescue => e
-            OpenTelemetry.handle_error(exception: e)
-          end
-
-          def tracer
-            RubyLLM::Instrumentation.instance.tracer
           end
         end
       end

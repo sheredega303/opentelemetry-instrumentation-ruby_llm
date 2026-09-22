@@ -50,7 +50,9 @@ class InstrumentationTest < Minitest::Test
   end
 
   def test_creates_span_with_attributes
-    stub_chat_completion
+    # A response model distinct from the request model, so the assertion
+    # below cannot pass by reading `gen_ai.request.model`.
+    stub_chat_completion(chat_completion_body(model: "gpt-4o-mini-2024-07-18"))
 
     chat = RubyLLM.chat(model: "gpt-4o-mini")
     chat.ask("Hi")
@@ -68,6 +70,7 @@ class InstrumentationTest < Minitest::Test
     assert_nil span.attributes["gen_ai.request.stream"]
     assert_equal 10, span.attributes["gen_ai.usage.input_tokens"]
     assert_equal 5, span.attributes["gen_ai.usage.output_tokens"]
+    assert_equal "gpt-4o-mini-2024-07-18", span.attributes["gen_ai.response.model"]
   end
 
   def test_marks_streaming_chat_requests
@@ -225,14 +228,16 @@ class InstrumentationTest < Minitest::Test
     assert_equal "execute_tool", tool_span.attributes["gen_ai.operation.name"]
     assert_equal "calculator", tool_span.attributes["gen_ai.tool.name"]
     assert_equal "Performs math", tool_span.attributes["gen_ai.tool.description"]
-    assert_equal '{"expression":"2+2"}', tool_span.attributes["gen_ai.tool.call.arguments"]
-    assert_equal "4", tool_span.attributes["gen_ai.tool.call.result"]
     assert_equal "call_abc123", tool_span.attributes["gen_ai.tool.call.id"]
+    # Arguments are model-generated from the prompt and the result is
+    # provider or application data, so neither is exported by default.
+    assert_nil tool_span.attributes["gen_ai.tool.call.arguments"]
+    assert_nil tool_span.attributes["gen_ai.tool.call.result"]
     assert_equal "function", tool_span.attributes["gen_ai.tool.type"]
   end
 
   # A turn that calls a tool must stay one trace: 1.x nests it by recursing,
-  # 2.0 needs the `chat_turn` wrapper. Asserted as a shape, not by span name,
+  # 2.0 needs the `chat_turn` wrapper. Asserted as a shape, not by name,
   # so the test is honest on both majors.
   def test_tool_call_turn_is_a_single_trace
     calculator = Class.new(RubyLLM::Tool) do
@@ -310,8 +315,10 @@ class InstrumentationTest < Minitest::Test
 
     OpenTelemetry::Instrumentation::RubyLLM::Instrumentation.instance.config[:tool_result_max_length] = 700
 
-    chat = with_tool(RubyLLM.chat(model: "gpt-4o-mini"), echo)
-    chat.ask("echo please")
+    with_capture_content do
+      chat = with_tool(RubyLLM.chat(model: "gpt-4o-mini"), echo)
+      chat.ask("echo please")
+    end
 
     tool_span = EXPORTER.finished_spans.find { |s| s.name.start_with?("execute_tool ") }
     assert_equal "x" * 700, tool_span.attributes["gen_ai.tool.call.result"]
@@ -342,10 +349,40 @@ class InstrumentationTest < Minitest::Test
       )
     )
 
-    with_tool(RubyLLM.chat(model: "gpt-4o-mini"), structured_tool).ask("What is 2+2?")
+    with_capture_content do
+      with_tool(RubyLLM.chat(model: "gpt-4o-mini"), structured_tool).ask("What is 2+2?")
+    end
 
     tool_span = EXPORTER.finished_spans.find { |s| s.name.start_with?("execute_tool ") }
     assert_equal({ "answer" => 4, "source" => "calculator" }, JSON.parse(tool_span.attributes["gen_ai.tool.call.result"]))
+  end
+
+  def test_captures_tool_call_content_when_enabled
+    calculator = Class.new(RubyLLM::Tool) do
+      def self.name = "calculator"
+      description "Performs math"
+      tool_parameter :expression, type: "string", description: "Math expression"
+
+      def execute(expression:)
+        eval(expression).to_s
+      end
+    end
+
+    stub_chat_completion(
+      chat_completion_body(
+        content: nil,
+        tool_calls: [{ id: "call_abc123", name: "calculator", arguments: '{"expression":"2+2"}' }]
+      ),
+      chat_completion_body(content: "The answer is 4")
+    )
+
+    with_capture_content do
+      with_tool(RubyLLM.chat(model: "gpt-4o-mini"), calculator).ask("What is 2+2?")
+    end
+
+    tool_span = EXPORTER.finished_spans.find { |s| s.name.start_with?("execute_tool ") }
+    assert_equal '{"expression":"2+2"}', tool_span.attributes["gen_ai.tool.call.arguments"]
+    assert_equal "4", tool_span.attributes["gen_ai.tool.call.result"]
   end
 
   def test_records_error_when_tool_raises
@@ -559,6 +596,46 @@ class InstrumentationTest < Minitest::Test
     assert_equal "Hello!", response.content
   end
 
+  # An assistant message that only requests tool calls has no text: nil on
+  # 1.x, "" on 2.0. Neither should produce a text part, so the captured
+  # messages match across majors.
+  def test_tool_only_assistant_message_has_no_text_part
+    calculator = Class.new(RubyLLM::Tool) do
+      def self.name = "calculator"
+      description "Performs math"
+      tool_parameter :expression, type: "string", description: "Math expression"
+
+      def execute(expression:)
+        expression.length.to_s
+      end
+    end
+
+    stub_chat_completion(
+      chat_completion_body(
+        content: nil,
+        tool_calls: [{ id: "call_abc123", name: "calculator", arguments: '{"expression":"2+2"}' }]
+      ),
+      chat_completion_body(content: "Done")
+    )
+
+    with_capture_content do
+      with_tool(RubyLLM.chat(model: "gpt-4o-mini"), calculator).ask("What is 2+2?")
+    end
+
+    # 1.x reaches the second request by recursing, so the tool-call message
+    # is only ever a span's input; on 2.0 it is the first `generate`'s
+    # output. Scanning the inputs finds it on both.
+    messages = EXPORTER.finished_spans
+                       .select { |s| s.name.start_with?("chat ") }
+                       .filter_map { |s| s.attributes["gen_ai.input.messages"] }
+                       .flat_map { |json| JSON.parse(json) }
+
+    tool_call_message = messages.find { |m| m["parts"].any? { |part| part["type"] == "tool_call" } }
+    refute_nil tool_call_message, "no message carried a tool_call part"
+
+    assert_equal ["tool_call"], tool_call_message["parts"].map { |part| part["type"] }
+  end
+
   def test_captures_message_attachments
     OpenTelemetry::Instrumentation::RubyLLM::Instrumentation.instance.config[:capture_content] = true
 
@@ -685,6 +762,112 @@ class InstrumentationTest < Minitest::Test
     assert_equal "assistant", output_messages[0]["role"]
   ensure
     ENV.delete("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT")
+  end
+
+  # The comment on `for_version` justifies matching the major segment rather
+  # than `>=`, because a prerelease sorts below the release it leads to. A
+  # `>=` rewrite that is correct for major 3 still breaks this.
+  def test_for_version_selects_adapter_by_major_including_prereleases
+    adapters = OpenTelemetry::Instrumentation::RubyLLM::Adapters
+
+    assert_equal adapters::V1, adapters.for_version("1.8.0")
+    assert_equal adapters::V1, adapters.for_version("1.12.1")
+    assert_equal adapters::V2, adapters.for_version("2.0.0")
+    assert_equal adapters::V2, adapters.for_version("2.0.0.rc1")
+    assert_equal adapters::V2, adapters.for_version("2.7.3")
+    assert_nil adapters.for_version("3.0.0")
+    assert_nil adapters.for_version("0.9.0")
+  end
+
+  # `compatible?` must decline rather than raise, so a version string that
+  # `Gem::Version` rejects cannot take down `SDK.configure`.
+  def test_for_version_declines_a_malformed_version
+    assert_nil OpenTelemetry::Instrumentation::RubyLLM::Adapters.for_version("not-a-version")
+    refute OpenTelemetry::Instrumentation::RubyLLM::Adapters.supports?("not-a-version")
+  end
+
+  def test_install_binds_the_adapter_for_the_running_major
+    expected = RUBY_LLM_V2 ? :V2 : :V1
+    adapter = OpenTelemetry::Instrumentation::RubyLLM::Instrumentation.instance.adapter
+
+    assert_equal OpenTelemetry::Instrumentation::RubyLLM::Adapters.const_get(expected), adapter
+  end
+
+  # On 2.0 the provider request succeeds and only the tool fails, so the turn
+  # root is the one span that can carry the failure. On 1.x the recursive
+  # `complete` puts the tool inside the `chat` span, which carries it instead.
+  def test_tool_failure_marks_the_trace_root_as_error
+    boom = Class.new(RubyLLM::Tool) do
+      def self.name = "boom"
+      description "Always raises"
+
+      def execute
+        raise ArgumentError, "tool failure"
+      end
+    end
+
+    stub_chat_completion(
+      chat_completion_body(
+        content: nil,
+        tool_calls: [{ id: "call_x", name: "boom", arguments: "{}" }]
+      )
+    )
+
+    chat = with_tool(RubyLLM.chat(model: "gpt-4o-mini"), boom)
+    assert_raises(ArgumentError) { chat.ask("trigger") }
+
+    root = EXPORTER.finished_spans.find { |s| s.parent_span_id == OpenTelemetry::Trace::INVALID_SPAN_ID }
+
+    assert_equal OpenTelemetry::Trace::Status::ERROR, root.status.code
+    assert_equal "ArgumentError", root.attributes["error.type"]
+
+    return unless RUBY_LLM_V2
+
+    chat_span = EXPORTER.finished_spans.find { |s| s.name.start_with?("chat ") }
+    assert_equal OpenTelemetry::Trace::Status::UNSET, chat_span.status.code
+  end
+
+  def test_turn_root_carries_the_conversation_id
+    calculator = Class.new(RubyLLM::Tool) do
+      def self.name = "calculator"
+      description "Performs math"
+      tool_parameter :expression, type: "string", description: "Math expression"
+
+      def execute(expression:)
+        expression.length.to_s
+      end
+    end
+
+    stub_chat_completion(
+      chat_completion_body(
+        content: nil,
+        tool_calls: [{ id: "call_abc123", name: "calculator", arguments: '{"expression":"2+2"}' }]
+      ),
+      chat_completion_body(content: "Done")
+    )
+
+    chat = RubyLLM.chat(model: "gpt-4o-mini")
+    with_tool(chat, calculator)
+    chat.otel_conversation_id = "conv-42"
+    chat.ask("What is 2+2?")
+
+    root = EXPORTER.finished_spans.find { |s| s.parent_span_id == OpenTelemetry::Trace::INVALID_SPAN_ID }
+    assert_equal "conv-42", root.attributes["gen_ai.conversation.id"]
+  end
+
+  # The provider error message can be the raw response body, so it is only
+  # recorded with content capture on. The type is always useful and safe.
+  def test_error_message_is_withheld_without_content_capture
+    stub_chat_completion_failure
+
+    assert_raises { RubyLLM.chat(model: "gpt-4o-mini").ask("Hi") }
+
+    span = EXPORTER.finished_spans.last
+    exception_events = span.events.select { |e| e.name == "exception" }
+
+    assert_equal 1, exception_events.length
+    assert_nil exception_events.first.attributes["exception.message"]
+    assert_equal span.attributes["error.type"], exception_events.first.attributes["exception.type"]
   end
 
   private

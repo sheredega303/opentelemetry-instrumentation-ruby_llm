@@ -24,7 +24,7 @@ module OpenTelemetry
         end
 
         def self.format_system_instructions(messages)
-          messages.flat_map { |m| Adapters.current.content_parts(m) }.to_json
+          messages.flat_map { |m| adapter.content_parts(m) }.to_json
         end
 
         # Maps a `RubyLLM::Attachment` onto a GenAI message part. Public
@@ -45,8 +45,21 @@ module OpenTelemetry
           part
         end
 
+        # Caps a single part's payload. Provider-native content has no size
+        # ceiling of its own, and an unbounded span attribute is dropped by
+        # the collector along with the rest of its export batch.
+        def self.bounded(value)
+          limit = RubyLLM::Instrumentation.instance.config[:tool_result_max_length]
+          limit = RubyLLM::Instrumentation::DEFAULT_TOOL_RESULT_MAX_LENGTH unless limit.is_a?(Integer) && limit.positive?
+          value.to_s[0, limit]
+        end
+
+        private_class_method def self.adapter
+          RubyLLM::Instrumentation.instance.adapter
+        end
+
         private_class_method def self.format_message(message)
-          msg = { role: message.role.to_s, parts: Adapters.current.content_parts(message) }
+          msg = { role: message.role.to_s, parts: adapter.content_parts(message) }
 
           if message.tool_calls&.any?
             message.tool_calls.each_value do |tc|
