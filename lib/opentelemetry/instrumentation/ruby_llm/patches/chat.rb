@@ -1,10 +1,16 @@
 # frozen_string_literal: true
 
+require_relative "span_helpers"
+require_relative "../adapters"
+require_relative "../message_formatter"
+
 module OpenTelemetry
   module Instrumentation
     module RubyLLM
       module Patches
         module Chat
+          include SpanHelpers
+
           attr_writer :otel_conversation_id
 
           def otel_conversation_id
@@ -17,39 +23,54 @@ module OpenTelemetry
             self
           end
 
+          private
+
+          # Arguments are model-generated from the user's prompt and results
+          # are provider or application data, so both are message content and
+          # follow the same capture setting as the transcript.
           def execute_tool(tool_call)
             attributes = {
               "gen_ai.operation.name" => "execute_tool",
               "gen_ai.tool.name" => tool_call.name,
               "gen_ai.tool.call.id" => tool_call.id,
-              "gen_ai.tool.call.arguments" => tool_call.arguments.to_json,
               "gen_ai.tool.type" => "function",
               "gen_ai.tool.description" => tools[tool_call.name.to_sym]&.description
             }.compact
+            attributes["gen_ai.tool.call.arguments"] = truncate(tool_call.arguments.to_json) if capture_content?
 
-            tracer.in_span("execute_tool #{tool_call.name}", attributes: attributes, kind: OpenTelemetry::Trace::SpanKind::INTERNAL) do |span|
+            in_tool_span(tool_call, attributes) { super }
+          end
+
+          def in_tool_span(tool_call, attributes)
+            tracer.in_span("execute_tool #{tool_call.name}",
+                           attributes: attributes,
+                           kind: OpenTelemetry::Trace::SpanKind::INTERNAL,
+                           record_exception: false) do |span|
               begin
-                result = super
+                result = yield
               rescue => e
-                span.record_exception(e)
-                span.status = OpenTelemetry::Trace::Status.error(e.message)
-                span.set_attribute("error.type", e.class.name)
+                record_error(span, e)
                 raise
               end
 
-              # `RubyLLM::Tool::Halt#to_s` returns `@content.to_s`, so preserve
-              # `to_s` for Halt (ruby_llm 1.x only; 2.0 removed it) and
-              # plain-result cases while serializing hashes.
-              tool_result = result.is_a?(Hash) ? result.to_json : result.to_s
-              span.set_attribute("gen_ai.tool.call.result", tool_result[0, tool_result_max_length])
+              if capture_content?
+                # `RubyLLM::Tool::Halt#to_s` returns `@content.to_s`, so preserve
+                # `to_s` for Halt (ruby_llm 1.x only; 2.0 removed it) and
+                # plain-result cases while serializing hashes.
+                safely do
+                  tool_result = result.is_a?(Hash) ? result.to_json : result.to_s
+                  span.set_attribute("gen_ai.tool.call.result", truncate(tool_result))
+                end
+              end
 
               result
             end
           end
 
-          private
-
           # Wraps one provider request: `complete` on 1.x, `generate` on 2.0.
+          # On 2.0 a `generate` with fallbacks configured retries across models
+          # inside this span, so `gen_ai.request.model` names the model the
+          # request started on.
           def in_chat_span(streaming:)
             provider = @model&.provider || "unknown"
             model_id = @model&.id || "unknown"
@@ -65,37 +86,18 @@ module OpenTelemetry
             # the request is streaming. Absence means non-streaming.
             attributes["gen_ai.request.stream"] = true if streaming
 
-            tracer.in_span("chat #{model_id}", attributes: attributes, kind: OpenTelemetry::Trace::SpanKind::CLIENT) do |span|
+            tracer.in_span("chat #{model_id}",
+                           attributes: attributes,
+                           kind: OpenTelemetry::Trace::SpanKind::CLIENT,
+                           record_exception: false) do |span|
               begin
                 result = yield
               rescue => e
-                span.record_exception(e)
-                span.status = OpenTelemetry::Trace::Status.error(e.message)
-                span.set_attribute("error.type", e.class.name)
+                record_error(span, e)
                 raise
               end
 
-              if @messages.last
-                response = @messages.last
-                adapter = Adapters.current
-
-                response_model = adapter.response_model(response)
-                span.set_attribute("gen_ai.response.model", response_model) if response_model
-                adapter.usage_attributes(response).each { |key, value| span.set_attribute(key, value) }
-                span.set_attribute("gen_ai.request.temperature", @temperature) if @temperature
-
-                if capture_content?
-                  system_messages = @messages.select { |m| m.role == :system }
-                  input_messages = @messages[0..-2].reject { |m| m.role == :system }
-
-                  unless system_messages.empty?
-                    span.set_attribute("gen_ai.system_instructions", MessageFormatter.format_system_instructions(system_messages))
-                  end
-
-                  span.set_attribute("gen_ai.input.messages", MessageFormatter.format_input_messages(input_messages))
-                  span.set_attribute("gen_ai.output.messages", MessageFormatter.format_output_messages([response]))
-                end
-              end
+              safely { set_response_attributes(span) }
 
               result
             ensure
@@ -103,29 +105,26 @@ module OpenTelemetry
             end
           end
 
-          def set_custom_attributes(span)
-            @otel_attributes&.each { |key, value| span.set_attribute(key, value.respond_to?(:call) ? value.call : value) }
-          end
+          def set_response_attributes(span)
+            response = @messages.last
+            return unless response
 
-          def capture_content?
-            env_value = ENV["OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"]
-            return env_value.to_s.strip.casecmp("true").zero? unless env_value.nil?
+            response_model = adapter.response_model(response)
+            span.set_attribute("gen_ai.response.model", response_model) if response_model
+            adapter.usage_attributes(response).each { |key, value| span.set_attribute(key, value) }
+            span.set_attribute("gen_ai.request.temperature", @temperature) if @temperature
 
-            RubyLLM::Instrumentation.instance.config[:capture_content]
-          end
+            return unless capture_content?
 
-          def tool_result_max_length
-            env_value = ENV["OTEL_INSTRUMENTATION_GENAI_TOOL_RESULT_MAX_LENGTH"]
-            if env_value
-              parsed = Integer(env_value.to_s.strip, exception: false)
-              return parsed unless parsed.nil?
+            system_messages = @messages.select { |m| m.role == :system }
+            input_messages = @messages[0..-2].reject { |m| m.role == :system }
+
+            unless system_messages.empty?
+              span.set_attribute("gen_ai.system_instructions", MessageFormatter.format_system_instructions(system_messages))
             end
 
-            RubyLLM::Instrumentation.instance.config[:tool_result_max_length]
-          end
-
-          def tracer
-            RubyLLM::Instrumentation.instance.tracer
+            span.set_attribute("gen_ai.input.messages", MessageFormatter.format_input_messages(input_messages))
+            span.set_attribute("gen_ai.output.messages", MessageFormatter.format_output_messages([response]))
           end
         end
 
@@ -144,33 +143,50 @@ module OpenTelemetry
           end
 
           # 2.0 runs tools between `generate` calls, so without this span a
-          # turn is three sibling roots, i.e. three unrelated traces. Not
-          # named `chat`: that means exactly one provider request on every
-          # version. Carries no usage, so nothing is counted twice, but it is
-          # the trace root, so it must carry the custom attributes that
-          # backends read at trace level.
+          # turn is three sibling roots, i.e. three unrelated traces. Named
+          # `invoke_agent` because the GenAI conventions define that as agent
+          # invocation within the same process and prescribe it when no agent
+          # name is available; `chat` stays reserved for exactly one provider
+          # request on every version. Carries no usage, so nothing is counted
+          # twice, but it is the trace root, so it must carry the custom
+          # attributes that backends read at trace level.
           def complete(&)
-            return super unless tools.any?
+            return super unless otel_turn_loops?
+            # `Patches::Agent` already opened an `invoke_agent` span for this
+            # turn; a second one would nest identically-named spans.
+            return super if agent_span_open?
 
             model_id = @model&.id || "unknown"
             attributes = {
-              "gen_ai.operation.name" => "chat_turn",
+              "gen_ai.operation.name" => "invoke_agent",
               "gen_ai.provider.name" => @model&.provider || "unknown",
               "gen_ai.request.model" => model_id
             }
             conversation_id = otel_conversation_id
             attributes["gen_ai.conversation.id"] = conversation_id if conversation_id
 
-            tracer.in_span("chat_turn #{model_id}", attributes: attributes, kind: OpenTelemetry::Trace::SpanKind::INTERNAL) do |span|
+            tracer.in_span("invoke_agent #{model_id}",
+                           attributes: attributes,
+                           kind: OpenTelemetry::Trace::SpanKind::INTERNAL,
+                           record_exception: false) do |span|
               super
             rescue => e
-              span.record_exception(e)
-              span.status = OpenTelemetry::Trace::Status.error(e.message)
-              span.set_attribute("error.type", e.class.name)
+              record_error(span, e)
               raise
             ensure
               set_custom_attributes(span)
             end
+          end
+
+          private
+
+          # Local tools are not the only thing that makes `complete` loop:
+          # provider tools go back to `generate` after their results are
+          # appended, with `tools` empty throughout.
+          def otel_turn_loops?
+            return true if tools.any?
+
+            respond_to?(:provider_tools) && provider_tools.any?
           end
         end
       end

@@ -72,6 +72,15 @@ module ChatCompletionStubs
 
   # `Chat#with_tool` became `Chat#with_tools` in ruby_llm 2.0. Both return the
   # receiver, so this works for `RubyLLM::Agent` too.
+  def with_capture_content
+    config = OpenTelemetry::Instrumentation::RubyLLM::Instrumentation.instance.config
+    original = config[:capture_content]
+    config[:capture_content] = true
+    yield
+  ensure
+    config[:capture_content] = original
+  end
+
   def with_tool(chat, tool)
     RUBY_LLM_V2 ? chat.with_tools(tool) : chat.with_tool(tool)
   end
