@@ -8,6 +8,8 @@ module OpenTelemetry
         # tell that the turn it is about to wrap already has one.
         AGENT_SPAN_KEY = OpenTelemetry::Context.create_key("ruby_llm.agent_span")
 
+        TURN_SPAN_KEY = OpenTelemetry::Context.create_key("ruby_llm.turn_span")
+
         # Span plumbing shared by the chat, agent and embedding patches: the
         # tracer, the version adapter, the two capture settings, and the
         # writers for custom attributes and errors.
@@ -20,6 +22,14 @@ module OpenTelemetry
 
           def with_agent_span_marker(&)
             OpenTelemetry::Context.with_value(AGENT_SPAN_KEY, true, &)
+          end
+
+          def turn_span_open?
+            !OpenTelemetry::Context.current[TURN_SPAN_KEY].nil?
+          end
+
+          def with_turn_span_marker(&)
+            OpenTelemetry::Context.with_value(TURN_SPAN_KEY, true, &)
           end
 
           def tracer
@@ -92,6 +102,13 @@ module OpenTelemetry
               )
               span.status = OpenTelemetry::Trace::Status.error(error.class.name)
             end
+          end
+
+          # The failing operation's own span records the exception; this
+          # only carries it outward.
+          def mark_error(span, error)
+            span.set_attribute("error.type", error.class.name)
+            span.status = OpenTelemetry::Trace::Status.error(error.class.name)
           end
         end
       end

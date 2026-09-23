@@ -99,8 +99,11 @@ if defined?(RubyLLM::Agent)
       assert agent_span.attributes["error.type"]
       assert_equal OpenTelemetry::Trace::Status::ERROR, agent_span.status.code
 
-      exception_events = agent_span.events.select { |e| e.name == "exception" }
-      assert_equal 1, exception_events.length
+      assert_empty((agent_span.events || []).select { |e| e.name == "exception" },
+                   "the agent span propagates the error, it does not originate it")
+
+      chat_span = EXPORTER.finished_spans.find { |s| s.name.start_with?("chat ") }
+      assert_equal 1, (chat_span.events || []).count { |e| e.name == "exception" }
     end
 
     def test_sets_otel_attributes_on_agent_span_when_ask_fails

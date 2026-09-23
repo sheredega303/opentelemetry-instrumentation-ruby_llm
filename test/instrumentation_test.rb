@@ -826,6 +826,89 @@ class InstrumentationTest < Minitest::Test
 
     chat_span = EXPORTER.finished_spans.find { |s| s.name.start_with?("chat ") }
     assert_equal OpenTelemetry::Trace::Status::UNSET, chat_span.status.code
+
+    tool_span = EXPORTER.finished_spans.find { |s| s.name.start_with?("execute_tool ") }
+    assert_equal 1, (tool_span.events || []).count { |e| e.name == "exception" }
+    assert_empty((root.events || []).select { |e| e.name == "exception" },
+                 "the turn root propagates the error, it does not originate it")
+  end
+
+  def test_manual_step_loop_groups_each_move_under_a_turn_root
+    skip "`Chat#step` is ruby_llm 2.0 API" unless RUBY_LLM_V2
+
+    calculator = Class.new(RubyLLM::Tool) do
+      def self.name = "calculator"
+      description "Performs math"
+      tool_parameter :expression, type: "string", description: "Math expression"
+
+      def execute(expression:)
+        expression.length.to_s
+      end
+    end
+
+    stub_chat_completion(
+      chat_completion_body(
+        content: nil,
+        tool_calls: [{ id: "call_abc123", name: "calculator", arguments: '{"expression":"2+2"}' }]
+      ),
+      chat_completion_body(content: "Done")
+    )
+
+    chat = with_tool(RubyLLM.chat(model: "gpt-4o-mini"), calculator)
+    chat.ask_later("What is 2+2?")
+    chat.step until chat.complete? || chat.awaiting_approval?
+
+    spans = EXPORTER.finished_spans
+    roots, children = spans.partition { |s| s.parent_span_id == OpenTelemetry::Trace::INVALID_SPAN_ID }
+
+    refute_empty children
+    assert_equal ["invoke_agent"], roots.map { |s| s.attributes["gen_ai.operation.name"] }.uniq
+    assert(children.none? { |s| s.name.start_with?("invoke_agent") },
+           "a nested move must reuse the open turn span, not open its own")
+
+    # A finished chat has nothing left to advance, so neither entry point
+    # does any work and neither should leave an empty span behind.
+    EXPORTER.reset
+    chat.step
+    chat.run_tools
+
+    assert_empty EXPORTER.finished_spans
+  end
+
+  # `run_tools` resumes a round on its own, without `step` having opened a
+  # turn span first, so it has to open one itself.
+  def test_run_tools_called_directly_parents_the_tool_spans
+    skip "`Chat#run_tools` is ruby_llm 2.0 API" unless RUBY_LLM_V2
+
+    calculator = Class.new(RubyLLM::Tool) do
+      def self.name = "calculator"
+      description "Performs math"
+      tool_parameter :expression, type: "string", description: "Math expression"
+
+      def execute(expression:)
+        expression.length.to_s
+      end
+    end
+
+    stub_chat_completion(
+      chat_completion_body(
+        content: nil,
+        tool_calls: [{ id: "call_abc123", name: "calculator", arguments: '{"expression":"2+2"}' }]
+      )
+    )
+
+    chat = with_tool(RubyLLM.chat(model: "gpt-4o-mini"), calculator)
+    chat.ask_later("What is 2+2?")
+    chat.generate
+    EXPORTER.reset
+    chat.run_tools
+
+    spans = EXPORTER.finished_spans
+    tool_span = spans.find { |s| s.name.start_with?("execute_tool ") }
+    parent = spans.find { |s| s.span_id == tool_span.parent_span_id }
+
+    refute_nil parent, "the tool span must hang from the turn span run_tools opened"
+    assert_equal "invoke_agent", parent.attributes["gen_ai.operation.name"]
   end
 
   def test_turn_root_carries_the_conversation_id

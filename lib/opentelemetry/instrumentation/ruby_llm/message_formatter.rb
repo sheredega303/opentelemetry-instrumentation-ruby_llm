@@ -15,15 +15,15 @@ module OpenTelemetry
       # does not pollute the patched class. Only a message's parts differ
       # between ruby_llm majors, so those come from the version adapter.
       module MessageFormatter
-        def self.format_input_messages(messages)
-          messages.map { |m| format_message(m) }.to_json
+        def self.format_input_messages(messages, adapter)
+          messages.map { |m| format_message(m, adapter) }.to_json
         end
 
-        def self.format_output_messages(messages)
-          messages.map { |m| format_message(m) }.to_json
+        def self.format_output_messages(messages, adapter)
+          messages.map { |m| format_message(m, adapter) }.to_json
         end
 
-        def self.format_system_instructions(messages)
+        def self.format_system_instructions(messages, adapter)
           messages.flat_map { |m| adapter.content_parts(m) }.to_json
         end
 
@@ -54,11 +54,7 @@ module OpenTelemetry
           value.to_s[0, limit]
         end
 
-        private_class_method def self.adapter
-          RubyLLM::Instrumentation.instance.adapter
-        end
-
-        private_class_method def self.format_message(message)
+        private_class_method def self.format_message(message, adapter)
           msg = { role: message.role.to_s, parts: adapter.content_parts(message) }
 
           if message.tool_calls&.any?

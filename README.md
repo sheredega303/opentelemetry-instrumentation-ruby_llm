@@ -240,8 +240,24 @@ tool-calling loop is. It carries no usage attributes, and it is named apart from
 agent the wrapper is skipped, because `Patches::Agent` has already opened an
 `invoke_agent` span for the turn.
 
-The wrapper means a 2.0 tool turn emits one more span than the same turn on 1.x,
-which is worth knowing if your backend prices per span.
+The wrapper means a 2.0 chat with tools emits one more span than the same chat on
+1.x, which is worth knowing if your backend prices per span. It opens whenever
+tools are registered, not only when the model calls one, because whether the turn
+will loop is not known until the model has answered.
+
+`Chat#step` and `Chat#run_tools`, the single-move API behind `ask_later` and the
+approval flow, open the same wrapper, so the spans of one move stay together. A
+loop driven by hand therefore produces one trace per move rather than one per
+turn: only `complete` knows where a turn ends. Correlate the moves through
+`gen_ai.conversation.id`, which every wrapper carries.
+
+Two more things a 2.0 turn can do that leave more than one trace behind:
+
+- a turn paused on `Tool.requires_approval` gets one trace per `complete` call,
+  since the decision happens outside the process holding the span;
+- a model calling a tool that was never registered gets a result message back
+  from `ruby_llm` and generates again; with no tools registered at all, those
+  two requests are two traces.
 
 One caveat on `chat` spans: with `with_fallbacks` configured, 2.0 retries across
 the fallback models inside a single `generate`, so a `chat` span can cover more

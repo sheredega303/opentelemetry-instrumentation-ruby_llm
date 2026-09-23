@@ -50,7 +50,7 @@ module OpenTelemetry
                 safely { capture_messages(span) }
                 result
               rescue => e
-                record_error(span, e)
+                mark_error(span, e)
                 raise
               ensure
                 set_custom_attributes(span)
@@ -65,8 +65,8 @@ module OpenTelemetry
             return if messages.empty?
 
             input_messages = messages[0..-2].reject { |m| m.role == :system }
-            span.set_attribute("gen_ai.input.messages", MessageFormatter.format_input_messages(input_messages))
-            span.set_attribute("gen_ai.output.messages", MessageFormatter.format_output_messages([messages.last]))
+            span.set_attribute("gen_ai.input.messages", MessageFormatter.format_input_messages(input_messages, adapter))
+            span.set_attribute("gen_ai.output.messages", MessageFormatter.format_output_messages([messages.last], adapter))
           end
 
           def llm_chat

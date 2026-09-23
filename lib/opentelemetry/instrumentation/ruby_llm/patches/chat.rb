@@ -120,11 +120,11 @@ module OpenTelemetry
             input_messages = @messages[0..-2].reject { |m| m.role == :system }
 
             unless system_messages.empty?
-              span.set_attribute("gen_ai.system_instructions", MessageFormatter.format_system_instructions(system_messages))
+              span.set_attribute("gen_ai.system_instructions", MessageFormatter.format_system_instructions(system_messages, adapter))
             end
 
-            span.set_attribute("gen_ai.input.messages", MessageFormatter.format_input_messages(input_messages))
-            span.set_attribute("gen_ai.output.messages", MessageFormatter.format_output_messages([response]))
+            span.set_attribute("gen_ai.input.messages", MessageFormatter.format_input_messages(input_messages, adapter))
+            span.set_attribute("gen_ai.output.messages", MessageFormatter.format_output_messages([response], adapter))
           end
         end
 
@@ -142,6 +142,20 @@ module OpenTelemetry
             in_chat_span(streaming: block_given?) { super }
           end
 
+          def complete(&)
+            in_turn_span { super }
+          end
+
+          def step(&)
+            in_turn_span { super }
+          end
+
+          def run_tools
+            in_turn_span { super }
+          end
+
+          private
+
           # 2.0 runs tools between `generate` calls, so without this span a
           # turn is three sibling roots, i.e. three unrelated traces. Named
           # `invoke_agent` because the GenAI conventions define that as agent
@@ -150,11 +164,11 @@ module OpenTelemetry
           # request on every version. Carries no usage, so nothing is counted
           # twice, but it is the trace root, so it must carry the custom
           # attributes that backends read at trace level.
-          def complete(&)
-            return super unless otel_turn_loops?
+          def in_turn_span
+            return yield unless otel_turn_loops?
             # `Patches::Agent` already opened an `invoke_agent` span for this
             # turn; a second one would nest identically-named spans.
-            return super if agent_span_open?
+            return yield if agent_span_open? || turn_span_open?
 
             model_id = @model&.id || "unknown"
             attributes = {
@@ -165,25 +179,28 @@ module OpenTelemetry
             conversation_id = otel_conversation_id
             attributes["gen_ai.conversation.id"] = conversation_id if conversation_id
 
-            tracer.in_span("invoke_agent #{model_id}",
-                           attributes: attributes,
-                           kind: OpenTelemetry::Trace::SpanKind::INTERNAL,
-                           record_exception: false) do |span|
-              super
-            rescue => e
-              record_error(span, e)
-              raise
-            ensure
-              set_custom_attributes(span)
+            with_turn_span_marker do
+              tracer.in_span("invoke_agent #{model_id}",
+                             attributes: attributes,
+                             kind: OpenTelemetry::Trace::SpanKind::INTERNAL,
+                             record_exception: false) do |span|
+                yield
+              rescue => e
+                mark_error(span, e)
+                raise
+              ensure
+                set_custom_attributes(span)
+              end
             end
           end
 
-          private
-
           # Local tools are not the only thing that makes `complete` loop:
           # provider tools go back to `generate` after their results are
-          # appended, with `tools` empty throughout.
+          # appended, with `tools` empty throughout. A chat with nothing
+          # pending does not loop at all: `step` and `run_tools` return
+          # without working, and wrapping that would export an empty span.
           def otel_turn_loops?
+            return false if respond_to?(:complete?) && complete?
             return true if tools.any?
 
             respond_to?(:provider_tools) && provider_tools.any?
